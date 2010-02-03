@@ -16,6 +16,7 @@
 
 import distutils.core
 import sys
+import setuptools
 
 # Build the epoll extension for Linux systems with Python < 2.6
 extensions = []
