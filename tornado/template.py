@@ -87,55 +87,7 @@ import escape
 import logging
 import os.path
 import re
-from inspect import getargspec
 
-FILTER_SEPARATOR = '|'
-FILTER_ARGUMENT_SEPARATOR = ':'
-
-# This only matches constant *strings* (things in quotes or marked for
-# translation). Numbers are treated as variables for implementation reasons
-# (so that they retain their type when passed to filters).
-constant_string = r"""
-(?:%(i18n_open)s%(strdq)s%(i18n_close)s|
-%(i18n_open)s%(strsq)s%(i18n_close)s|
-%(strdq)s|
-%(strsq)s)
-""" % {
-    'strdq': r'"[^"\\]*(?:\\.[^"\\]*)*"', # double-quoted string
-    'strsq': r"'[^'\\]*(?:\\.[^'\\]*)*'", # single-quoted string
-    'i18n_open' : re.escape("_("),
-    'i18n_close' : re.escape(")"),
-    }
-constant_string = constant_string.replace("\n", "")
-
-filter_raw_string = r"""
-^(?P<func_call>[%(var_chars)s]+\(.*)|
-^(?P<constant>%(constant)s)|
-^(?P<var>[%(var_chars)s]+|%(num)s)|
- (?:%(filter_sep)s
-     (?P<filter_name>\w+)
-         (?:%(arg_sep)s
-             (?:
-              (?P<constant_arg>%(constant)s)|
-              (?P<var_arg>[%(var_chars)s]+|%(num)s)
-             )
-         )?
- )""" % {
-    'constant': constant_string,
-    'num': r'[-+\.]?\d[\d\.e]*',
-    'var_chars': "\w\." ,
-    'funcname_chars': "\w\.\_" ,
-    'filter_sep': re.escape(FILTER_SEPARATOR),
-    'arg_sep': re.escape(FILTER_ARGUMENT_SEPARATOR),
-  }
-
-filter_re = re.compile(filter_raw_string, re.UNICODE|re.VERBOSE)
-
-from django.template import builtins
-
-filters = {}
-for lib in builtins:
-  filters.update(lib.filters)
 
 class Template(object):
     """A compiled template.
@@ -366,81 +318,8 @@ class _Expression(_Node):
     def __init__(self, expression):
         self.expression = expression
 
-        #logging.debug('checking for filters in: ' + expression)
-        matches = filter_re.finditer(expression)
-        var_obj = None
-        self.filters = []
-        for match in matches:
-          #logging.debug(match.groups())
-          if var_obj is None:
-            var, constant, func_call = match.group("var", "constant", "func_call")
-            if func_call or var:
-              var_obj = func_call or var
-            elif constant:
-              pass
-            else:
-              raise Exception("of some sort")
-          else:
-            filter_name = match.group("filter_name")
-            filter_name = match.group("filter_name")
-            args = []
-            constant_arg, var_arg = match.group("constant_arg", "var_arg")
-            if constant_arg:
-                args.append(constant_arg)
-            elif var_arg:
-                args.append(var_arg)
-            filter_func = self.find_filter(filter_name)
-            self.args_check(filter_name, filter_func, args)
-            self.filters.append((filter_name, args))
-            #logging.debug('filter=%r' % ((filter_name, args),))
-
-        #logging.debug('changing %r to %r' % (expression, var_obj))
-        self.expression = var_obj
-
-    def args_check(name, func, provided):
-        provided = list(provided)
-        plen = len(provided)
-        # Check to see if a decorator is providing the real function.
-        func = getattr(func, '_decorated_function', func)
-        args, varargs, varkw, defaults = getargspec(func)
-        # First argument is filter input.
-        args.pop(0)
-        if defaults:
-            nondefs = args[:-len(defaults)]
-        else:
-            nondefs = args
-        # Args without defaults must be provided.
-        try:
-            for arg in nondefs:
-                provided.pop(0)
-        except IndexError:
-            # Not enough
-            raise Exception("%s requires %d arguments, %d provided" % (name, len(nondefs), plen))
-
-        # Defaults can be overridden.
-        defaults = defaults and list(defaults) or []
-        try:
-            for parg in provided:
-                defaults.pop(0)
-        except IndexError:
-            # Too many.
-            raise Exception("%s requires %d arguments, %d provided" % (name, len(nondefs), plen))
-
-        return True
-    args_check = staticmethod(args_check)
-
-    def find_filter(self, filter_name):
-        global filters
-        if filter_name in filters:
-            return filters[filter_name]
-        else:
-            raise Exception("Invalid filter: '%s'" % filter_name)
-
     def generate(self, writer):
         writer.write_line("_tmp = %s" % self.expression)
-        for filter in self.filters:
-          #logging.debug("_tmp = filters.%s(_tmp, *[%s])" % (filter[0], ",".join(filter[1])))
-          writer.write_line("_tmp = filters.%s(_tmp, *[%s])" % (filter[0], ",".join(filter[1])))
         writer.write_line("if isinstance(_tmp, str): _buffer.append(_tmp)")
         writer.write_line("elif isinstance(_tmp, unicode): "
                           "_buffer.append(_tmp.encode('utf-8'))")
