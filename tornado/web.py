@@ -70,6 +70,7 @@ import urllib
 import urlparse
 import uuid
 
+_log = logging.getLogger('tornado.web')
 
 class RequestHandler(object):
     """Subclass this class and define get() or post() to make a handler.
@@ -285,11 +286,11 @@ class RequestHandler(object):
         else:
             signature = self._cookie_signature(parts[0], parts[1])
         if not _time_independent_equals(parts[2], signature):
-            logging.warning("Invalid cookie signature %r", value)
+            _log.warning("Invalid cookie signature %r", value)
             return None
         timestamp = int(parts[1])
         if timestamp < time.time() - 31 * 86400:
-            logging.warning("Expired cookie %r", value)
+            _log.warning("Expired cookie %r", value)
             return None
         try:
             return base64.b64decode(parts[0])
@@ -422,8 +423,9 @@ class RequestHandler(object):
         if not getattr(RequestHandler, "_templates", None):
             RequestHandler._templates = {}
         if template_path not in RequestHandler._templates:
-            RequestHandler._templates[template_path] = template.Loader(
-                template_path)
+            loader = self.application.settings.get("template_loader") or\
+              template.Loader(template_path)
+            RequestHandler._templates[template_path] = loader
         t = RequestHandler._templates[template_path].load(template_name)
         args = dict(
             handler=self,
@@ -468,12 +470,13 @@ class RequestHandler(object):
     def finish(self, chunk=None):
         """Finishes this response, ending the HTTP request."""
         assert not self._finished
-        if chunk: self.write(chunk)
+        if chunk is not None: self.write(chunk)
 
         # Automatically support ETags and add the Content-Length header if
         # we have not flushed any content yet.
         if not self._headers_written:
-            if self._status_code == 200 and self.request.method == "GET":
+            if (self._status_code == 200 and self.request.method == "GET" and
+                "Etag" not in self._headers):
                 hasher = hashlib.sha1()
                 for part in self._write_buffer:
                     hasher.update(part)
@@ -502,7 +505,7 @@ class RequestHandler(object):
         for your application.
         """
         if self._headers_written:
-            logging.error("Cannot send error response after headers written")
+            _log.error("Cannot send error response after headers written")
             if not self._finished:
                 self.finish()
             return
@@ -676,7 +679,7 @@ class RequestHandler(object):
                 hashes[path] = hashlib.md5(f.read()).hexdigest()
                 f.close()
             except:
-                logging.error("Could not open static file %r", path)
+                _log.error("Could not open static file %r", path)
                 hashes[path] = None
         base = self.request.protocol + "://" + self.request.host \
             if getattr(self, "include_host", False) else ""
@@ -700,7 +703,7 @@ class RequestHandler(object):
                 return callback(*args, **kwargs)
             except Exception, e:
                 if self._headers_written:
-                    logging.error("Exception after headers written",
+                    _log.error("Exception after headers written",
                                   exc_info=True)
                 else:
                     self._handle_request_exception(e)
@@ -745,11 +748,11 @@ class RequestHandler(object):
 
     def _log(self):
         if self._status_code < 400:
-            log_method = logging.info
+            log_method = _log.info
         elif self._status_code < 500:
-            log_method = logging.warning
+            log_method = _log.warning
         else:
-            log_method = logging.error
+            log_method = _log.error
         request_time = 1000.0 * self.request.request_time()
         log_method("%d %s %.2fms", self._status_code,
                    self._request_summary(), request_time)
@@ -763,14 +766,14 @@ class RequestHandler(object):
             if e.log_message:
                 format = "%d %s: " + e.log_message
                 args = [e.status_code, self._request_summary()] + list(e.args)
-                logging.warning(format, *args)
+                _log.warning(format, *args)
             if e.status_code not in httplib.responses:
-                logging.error("Bad HTTP status code: %d", e.status_code)
+                _log.error("Bad HTTP status code: %d", e.status_code)
                 self.send_error(500, exception=e)
             else:
                 self.send_error(e.status_code, exception=e)
         else:
-            logging.error("Uncaught exception %s\n%r", self._request_summary(),
+            _log.error("Uncaught exception %s\n%r", self._request_summary(),
                           self.request, exc_info=e)
             self.send_error(500, exception=e)
 
@@ -1000,6 +1003,7 @@ class Application(object):
         transforms = [t(request) for t in self.transforms]
         handler = None
         args = []
+        kwargs = {}
         handlers = self._get_host_handlers(request)
         if not handlers:
             handler = RedirectHandler(
@@ -1009,7 +1013,14 @@ class Application(object):
                 match = spec.regex.match(request.path)
                 if match:
                     handler = spec.handler_class(self, request, **spec.kwargs)
-                    args = match.groups()
+                    # Pass matched groups to the handler.  Since
+                    # match.groups() includes both named and unnamed groups,
+                    # we want to use either groups or groupdict but not both.
+                    kwargs = match.groupdict()
+                    if kwargs:
+                        args = []
+                    else:
+                        args = match.groups()
                     break
             if not handler:
                 handler = ErrorHandler(self, request, 404)
@@ -1017,10 +1028,12 @@ class Application(object):
         # In debug mode, re-compile templates and reload static files on every
         # request so you don't need to restart to see changes
         if self.settings.get("debug"):
-            RequestHandler._templates = None
+            if getattr(RequestHandler, "_templates", None):
+              map(lambda loader: loader.reset(),
+                  RequestHandler._templates.values())
             RequestHandler._static_hashes = {}
 
-        handler._execute(transforms, *args)
+        handler._execute(transforms, *args, **kwargs)
         return handler
 
     def reverse_url(self, name, *args):

@@ -25,6 +25,8 @@ import select
 import time
 
 
+_log = logging.getLogger("tornado.ioloop")
+
 class IOLoop(object):
     """A level-triggered I/O loop.
 
@@ -81,6 +83,8 @@ class IOLoop(object):
 
     def __init__(self, impl=None):
         self._impl = impl or _poll()
+        if hasattr(self._impl, 'fileno'):
+            self._set_close_exec(self._impl.fileno())
         self._handlers = {}
         self._events = {}
         self._callbacks = set()
@@ -93,9 +97,11 @@ class IOLoop(object):
         r, w = os.pipe()
         self._set_nonblocking(r)
         self._set_nonblocking(w)
+        self._set_close_exec(r)
+        self._set_close_exec(w)
         self._waker_reader = os.fdopen(r, "r", 0)
         self._waker_writer = os.fdopen(w, "w", 0)
-        self.add_handler(r, self._read_waker, self.WRITE)
+        self.add_handler(r, self._read_waker, self.READ)
 
     @classmethod
     def instance(cls):
@@ -137,7 +143,7 @@ class IOLoop(object):
         try:
             self._impl.unregister(fd)
         except (OSError, IOError):
-            logging.debug("Error deleting fd from IOLoop", exc_info=True)
+            _log.debug("Error deleting fd from IOLoop", exc_info=True)
 
     def start(self):
         """Starts the I/O loop.
@@ -181,7 +187,7 @@ class IOLoop(object):
                 event_pairs = self._impl.poll(poll_timeout)
             except Exception, e:
                 if e.errno == errno.EINTR:
-                    logging.warning("Interrupted system call", exc_info=1)
+                    _log.warning("Interrupted system call", exc_info=1)
                     continue
                 else:
                     raise
@@ -202,10 +208,10 @@ class IOLoop(object):
                         # Happens when the client closes the connection
                         pass
                     else:
-                        logging.error("Exception in I/O handler for fd %d",
+                        _log.error("Exception in I/O handler for fd %d",
                                       fd, exc_info=True)
                 except:
-                    logging.error("Exception in I/O handler for fd %d",
+                    _log.error("Exception in I/O handler for fd %d",
                                   fd, exc_info=True)
         # reset the stopped flag so another start/stop pair can be issued
         self._stopped = False
@@ -261,7 +267,19 @@ class IOLoop(object):
         except (KeyboardInterrupt, SystemExit):
             raise
         except:
-            logging.error("Exception in callback %r", callback, exc_info=True)
+            self.handle_callback_exception(callback)
+
+    def handle_callback_exception(self, callback):
+        """This method is called whenever a callback run by the IOLoop
+        throws an exception.
+
+        By default simply logs the exception as an error.  Subclasses
+        may override this method to customize reporting of exceptions.
+
+        The exception itself is not passed explicitly, but is available
+        in sys.exc_info.
+        """
+        _log.error("Exception in callback %r", callback, exc_info=True)
 
     def _read_waker(self, fd, events):
         try:
@@ -274,9 +292,17 @@ class IOLoop(object):
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+    def _set_close_exec(self, fd):
+        flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
+
 
 class _Timeout(object):
     """An IOLoop timeout, a UNIX timestamp and a callback"""
+
+    # Reduce memory overhead when there are lots of pending callbacks
+    __slots__ = ['deadline', 'callback']
+
     def __init__(self, deadline, callback):
         self.deadline = deadline
         self.callback = callback
@@ -311,7 +337,7 @@ class PeriodicCallback(object):
         except (KeyboardInterrupt, SystemExit):
             raise
         except:
-            logging.error("Error in periodic callback", exc_info=True)
+            _log.error("Error in periodic callback", exc_info=True)
         self.start()
 
 
@@ -323,6 +349,9 @@ class _EPoll(object):
 
     def __init__(self):
         self._epoll_fd = epoll.epoll_create()
+
+    def fileno(self):
+        return self._epoll_fd
 
     def register(self, fd, events):
         epoll.epoll_ctl(self._epoll_fd, self._EPOLL_CTL_ADD, fd, events)
@@ -342,6 +371,9 @@ class _KQueue(object):
     def __init__(self):
         self._kqueue = select.kqueue()
         self._active = {}
+
+    def fileno(self):
+        return self._kqueue.fileno()
 
     def register(self, fd, events):
         self._control(fd, events, select.KQ_EV_ADD)
@@ -436,5 +468,5 @@ else:
         # All other systems
         import sys
         if "linux" in sys.platform:
-            logging.warning("epoll module not found; using select()")
+            _log.warning("epoll module not found; using select()")
         _poll = _Select
