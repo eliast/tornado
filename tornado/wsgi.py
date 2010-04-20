@@ -211,11 +211,13 @@ class WSGIContainer(object):
 
     def __call__(self, request):
         data = {}
+        response = []
         def start_response(status, response_headers, exc_info=None):
             data["status"] = status
             data["headers"] = response_headers
-        response = self.wsgi_application(
-            WSGIContainer.environ(request), start_response)
+            return response.append
+        response.extend(self.wsgi_application(
+                WSGIContainer.environ(request), start_response))
         body = "".join(response)
         if hasattr(response, "close"):
             response.close()
@@ -304,6 +306,6 @@ class HTTPHeaders(dict):
         headers = cls()
         for line in headers_string.splitlines():
             if line:
-                name, value = line.split(": ", 1)
-                headers[name] = value
+                name, value = line.split(":", 1)
+                headers[name] = value.strip()
         return headers
