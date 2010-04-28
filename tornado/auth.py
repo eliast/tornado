@@ -842,6 +842,200 @@ class FacebookMixin(object):
         if isinstance(body, unicode): body = body.encode("utf-8")
         return hashlib.md5(body).hexdigest()
 
+class LinkedInMixin(OAuthMixin):
+    """LinkedIn OAuth authentication.
+
+    To authenticate with LinkedIn, register your application with
+    LinkedIn at http://developer.linkedin.com/. Then copy your Consumer Key and
+    Consumer Secret to the application settings 'linkedin_consumer_key' and
+    'linkedin_consumer_secret'. Use this Mixin on the handler for the URL
+    you registered as your application's Callback URL.
+
+    When your application is set up, you can use this Mixin like this
+    to authenticate the user with Twitter and get access to their stream:
+
+    class LinkedInHandler(tornado.web.RequestHandler,
+      tornado.auth.LinkedInMixin):
+
+      @tornado.web.asynchronous
+      def get(self):
+        if self.get_argument("oauth_token", None):
+          self.get_authenticated_user(self.async_callback(self._on_auth))
+          return
+        self.authorize_redirect()
+
+      def _on_auth(self, user, access_token=None):
+        if not user:
+          raise tornado.web.HTTPError(500, "LinkedIn auth failed")
+
+        # Save the user using, e.g., set_secure_cookie()
+
+    The user object returned by get_authenticated_user() includes the
+    attributes 'id', 'first-name', 'last-name', 'api-standard-profile-request'
+    in addition to 'access_token'. You should save the access token with
+    the user; it is required to make requests on behalf of the user later
+    with linkedin_request().
+    """
+    _OAUTH_REQUEST_TOKEN_URL = "https://api.linkedin.com/uas/oauth/requestToken"
+    _OAUTH_ACCESS_TOKEN_URL = "https://api.linkedin.com/uas/oauth/accessToken"
+    _OAUTH_AUTHORIZE_URL = "https://api.linkedin.com/uas/oauth/authorize"
+
+    def authorize_redirect(self, callback_uri=None):
+        http = httpclient.AsyncHTTPClient()
+        headers = self._oauth_compute_auth_headers(self._OAUTH_REQUEST_TOKEN_URL, callback_uri=callback_uri)
+        token_request = httpclient.HTTPRequest(self._OAUTH_REQUEST_TOKEN_URL, "POST",
+          headers=headers, body='')
+        http.fetch(token_request, self.async_callback(self._on_request_token))
+
+    def _oauth_consumer_token(self):
+        self.require_setting("linkedin_consumer_key", "LinkedIn OAuth")
+        self.require_setting("linkedin_consumer_secret", "LinkedIn OAuth")
+        return dict(key=self.settings["linkedin_consumer_key"],
+            secret=self.settings["linkedin_consumer_secret"])
+
+    def _oauth_compute_auth_headers(self, url, method="POST",
+            request_token=None, access_token=None, callback_uri=None):
+        consumer_token = self._oauth_consumer_token()
+        args = dict(
+            oauth_consumer_key=consumer_token["key"],
+            oauth_signature_method="HMAC-SHA1",
+            oauth_timestamp=str(int(time.time())),
+            oauth_nonce=binascii.b2a_hex(uuid.uuid4().bytes),
+            oauth_version="1.0",
+        )
+
+        if callback_uri:
+          args['oauth_callback'] = callback_uri
+
+        token = None
+        if request_token:
+          args.update(dict(oauth_token=request_token["key"],
+            oauth_verifier=request_token["verifier"]))
+          token = request_token
+        if access_token:
+          args['oauth_token'] = access_token["key"]
+          token = access_token
+
+        signature = _oauth_signature(consumer_token, method, url, args, token=token)
+        args["oauth_signature"] = signature
+
+        authorization_header = 'OAuth %s' % ', '.join(['%s="%s"' % (k, _oauth_escape(v)) for k,v in args.items()])
+        return {'Authorization': authorization_header}
+
+    def _on_request_token(self, response):
+        if response.error:
+            raise Exception("Could not get request token")
+        request_token = _oauth_parse_response(response.body)
+        data = "|".join([request_token["key"], request_token["secret"]])
+        self.set_cookie("_oauth_request_token", data)
+        args = dict(oauth_token=request_token["key"])
+        self.redirect(self._OAUTH_AUTHORIZE_URL + "?" + urllib.urlencode(args))
+
+    def get_authenticated_user(self, callback):
+        request_key = self.get_argument("oauth_token")
+        request_verifier = self.get_argument("oauth_verifier")
+        request_cookie = self.get_cookie("_oauth_request_token")
+        if not request_cookie:
+            _log.warning("Missing OAuth request token cookie")
+            callback(None)
+            return
+        cookie_key, cookie_secret = request_cookie.split("|")
+        if cookie_key != request_key:
+            _log.warning("Request token does not match cookie")
+            callback(None)
+            return
+        token = dict(key=cookie_key, secret=cookie_secret, verifier=request_verifier)
+
+        http = httpclient.AsyncHTTPClient()
+        headers = self._oauth_compute_auth_headers(self._OAUTH_ACCESS_TOKEN_URL, request_token=token)
+        token_request = httpclient.HTTPRequest(self._OAUTH_ACCESS_TOKEN_URL, "POST",
+          headers=headers, body='')
+        http.fetch(token_request, self.async_callback(self._on_access_token, callback))
+
+    def _on_access_token(self, callback, response):
+        if response.error:
+            _log.warning("Could not fetch access token")
+            callback(None)
+            return
+        access_token = _oauth_parse_response(response.body)
+        user = self._oauth_get_user(access_token, self.async_callback(
+             self._on_oauth_get_user, access_token, callback))
+
+    def _oauth_get_user(self, access_token, callback):
+        basic_profile = '/v1/people/~:(id,first-name,last-name,api-standard-profile-request)'
+        self.linkedin_request(basic_profile, callback, access_token)
+
+    def xml_to_dict(self, e, include=None):
+        obj = {}
+        text = []
+        for n in e.childNodes:
+            if n.nodeType == 1:
+                if include and not n.nodeName in include: continue
+                obj[n.nodeName] = self.xml_to_dict(n)
+            elif n.nodeType == 3:
+                text.append(n.nodeValue)
+        return obj if obj else u"".join(text)
+
+    def _on_oauth_get_user(self, access_token, callback, user):
+        if not user:
+            callback(None)
+            return
+
+        from xml.dom.minidom import parse, parseString
+        root = parseString(user)
+        user_obj = self.xml_to_dict(root.documentElement)
+        user_obj['access_token'] = access_token
+        callback(user_obj)
+
+    def linkedin_request(self, path, callback, access_token):
+        """Fetches the given API path, e.g., "/v1/people/~"
+
+        If the request is a POST, post_args should be provided. Query
+        string arguments should be given as keyword arguments.
+
+        All the Profile API methods are documented at
+        http://developer.linkedin.com/docs/DOC-1002.
+
+        Many methods require an OAuth access token which you can obtain
+        through authorize_redirect() and get_authenticated_user(). The
+        user returned through that process includes an 'access_token'
+        attribute that can be used to make authenticated requests via
+        this method. Example usage:
+
+        class LinkedInHandler(tornado.web.RequestHandler,
+                              tornado.auth.LinkedInMixin):
+
+          @tornado.web.authenticated
+          @tornado.web.asynchronous
+          def get(self):
+              import urlparse
+              access_token = user.get('access_token', None)
+              profile_url = user.get('api-standard-profile-request', {}).get('url', '')
+              self.linkedin_request(urlparse.urlparse(profile_url).path,
+                self.async_callback(self._on_get_full_user, access_token), access_token)
+
+          def _on_get_full_user(self, access_token, user):
+              if not user:
+                  raise tornado.web.HTTPError(500, "LinkedIn full profile retrieval failed")
+
+              # User the XML request containing the full profile
+
+        """
+        # Add the OAuth resource request signature if we have credentials
+        url = "https://api.linkedin.com" + path
+        headers = self._oauth_compute_auth_headers(url, method=method,
+          access_token=access_token)
+        callback = self.async_callback(self._on_linkedin_request, callback)
+        http = httpclient.AsyncHTTPClient()
+        http.fetch(url, headers=headers, callback=callback)
+
+    def _on_linkedin_request(self, callback, response):
+        if response.error:
+            _log.warning("Error response %s fetching %s", response.error,
+                            response.request.url)
+            callback(None)
+            return
+        callback(response.body)
 
 def _oauth_signature(consumer_token, method, url, parameters={}, token=None):
     """Calculates the HMAC-SHA1 OAuth signature for the given request.
